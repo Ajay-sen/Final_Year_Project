@@ -1,11 +1,11 @@
 import numpy as np
 import hashlib
+import pywt
 from scipy.integrate import odeint
 
 class ImageEncryption:
     def __init__(self):
-        # 5D Hyperchaotic System Parameters (Lorenz-based, Yang 2009)
-        # This system is numerically stable and produces high-quality chaotic sequences
+        # 5D Hyperchaotic System Parameters (Yang, 2009)
         self.a = 10
         self.b = 8/3
         self.c = 28
@@ -22,71 +22,52 @@ class ImageEncryption:
         dx5 = -self.e * x2
         return [dx1, dx2, dx3, dx4, dx5]
 
-    def _generate_keys(self, total_pixels, x0):
-        """Generates chaotic sequences based on total pixel count."""
-        # Time steps for ODE solver
-        t = np.linspace(0, 500, total_pixels + 2000)
-        
-        # Solve differential equations
+    def _generate_chaotic_sequences(self, length, x0):
+        """Generate chaotic sequences of given length from initial conditions."""
+        t = np.linspace(0, 500, length + 2000)
         states = odeint(self._hyperchaotic_system, x0, t)
-        
-        # Discard first 2000 to remove transient effect
         states = states[2000:]
-        
-        # Key 1: For sorting/scrambling (Confusion) - use state variable x1
-        key_confusion = states[:total_pixels, 0]
-        
-        # Key 2: For Diffusion - use rank-based quantization for guaranteed uniformity
-        # Rank-based: sort the sequence, assign ranks, map ranks to 0-255
-        raw_seq = states[:total_pixels, 1]
-        ranks = np.argsort(np.argsort(raw_seq))  # Double argsort gives ranks
-        key_diffusion = (ranks * 256 // total_pixels).astype(np.uint8)
-        
-        # Key 3: Second diffusion key from another state variable
-        raw_seq2 = states[:total_pixels, 3]
-        ranks2 = np.argsort(np.argsort(raw_seq2))
-        key_diffusion2 = (ranks2 * 256 // total_pixels).astype(np.uint8)
-        
-        return key_confusion, key_diffusion, key_diffusion2
+        return states[:length]
 
     def _get_hash_initial_conditions(self, image_bytes):
-        """Generates initial conditions (x0) from SHA-512 hash of the image."""
-        hash_obj = hashlib.sha512(image_bytes)
+        """Generates initial conditions (x0) from SHA3-512 hash of the image."""
+        hash_obj = hashlib.sha3_512(image_bytes)
         hex_dig = hash_obj.hexdigest()
         
-        # Convert distinct parts of hash to float initial conditions
-        # We need 5 initial values for 5D system
         x0 = []
         for i in range(5):
-            # Take slices of the hash, convert hex to int, normalize
             chunk = hex_dig[i*8 : (i+1)*8]
-            val = int(chunk, 16) / (2**32) # Normalize to 0-1 range roughly
-            x0.append(val + 0.1) # Avoid zero state
+            val = int(chunk, 16) / (2**32)
+            x0.append(val + 0.1)
             
-        return x0
+        return x0, hex_dig
 
-    def _diffuse_forward(self, data, key):
-        """CBC-style forward diffusion: C[i] = (P[i] + K[i] + C[i-1]) mod 256"""
+    def _bwt_transform(self, data_bytes):
+        """Burrows-Wheeler Transform - returns transformed data and index."""
+        s = data_bytes
+        block_size = min(len(s), 256)
+        s = s[:block_size]
+        n = block_size
+        
+        rotations = sorted(range(n), key=lambda i: s[i:] + s[:i])
+        bwt_result = bytes([s[rotations[i] - 1] for i in range(n)])
+        index = rotations.index(0)
+        return bwt_result, index
+
+    def _psm_encrypt(self, data, key):
+        """Polyalphabetic Substitution Method with CBC feedback.
+           C[i] = (P[i] + K[i] + C[i-1]) mod 256"""
         result = np.empty(len(data), dtype=np.uint8)
-        prev = int(key[0])  # IV
+        prev = int(key[0])
         for i in range(len(data)):
             val = (int(data[i]) + int(key[i]) + prev) % 256
             result[i] = val
             prev = val
         return result
 
-    def _diffuse_backward(self, data, key):
-        """CBC-style backward diffusion: C[i] = (P[i] + K[i] + C[i+1]) mod 256"""
-        result = np.empty(len(data), dtype=np.uint8)
-        prev = int(key[-1])  # IV
-        for i in range(len(data) - 1, -1, -1):
-            val = (int(data[i]) + int(key[i]) + prev) % 256
-            result[i] = val
-            prev = val
-        return result
-
-    def _inverse_diffuse_forward(self, data, key):
-        """Inverse of forward CBC diffusion."""
+    def _psm_decrypt(self, data, key):
+        """Inverse PSM with CBC.
+           P[i] = (C[i] - K[i] - C[i-1]) mod 256"""
         result = np.empty(len(data), dtype=np.uint8)
         prev = int(key[0])
         for i in range(len(data)):
@@ -94,56 +75,239 @@ class ImageEncryption:
             prev = int(data[i])
         return result
 
-    def _inverse_diffuse_backward(self, data, key):
-        """Inverse of backward CBC diffusion."""
-        result = np.empty(len(data), dtype=np.uint8)
-        prev = int(key[-1])
-        for i in range(len(data) - 1, -1, -1):
-            result[i] = (int(data[i]) - int(key[i]) - prev) % 256
-            prev = int(data[i])
+    def _generate_key_stream(self, length, chaotic_states, state_idx):
+        """Generate uniform key stream using rank-based quantization."""
+        raw_seq = chaotic_states[:length, state_idx]
+        ranks = np.argsort(np.argsort(raw_seq))
+        key = (ranks * 256 // length).astype(np.uint8)
+        return key
+
+    def _wavelet_decompose(self, channel):
+        """Decompose a channel into 4 sub-bands using pixel subsampling.
+           Channel MUST have even dimensions (caller handles padding)."""
+        h, w = channel.shape
+        assert h % 2 == 0 and w % 2 == 0, "Channel must have even dimensions"
+        
+        LL = channel[0::2, 0::2].flatten()
+        LH = channel[0::2, 1::2].flatten()
+        HL = channel[1::2, 0::2].flatten()
+        HH = channel[1::2, 1::2].flatten()
+        
+        return LL, LH, HL, HH
+
+    def _wavelet_reconstruct(self, LL, LH, HL, HH, h, w):
+        """Reconstruct channel from 4 sub-bands. Perfect inverse of decompose."""
+        h2, w2 = h // 2, w // 2
+        
+        result = np.zeros((h, w), dtype=np.uint8)
+        result[0::2, 0::2] = LL.reshape(h2, w2)
+        result[0::2, 1::2] = LH.reshape(h2, w2)
+        result[1::2, 0::2] = HL.reshape(h2, w2)
+        result[1::2, 1::2] = HH.reshape(h2, w2)
+        
         return result
 
     def encrypt(self, image_path):
         import cv2
         # 1. Load Image
         img = cv2.imread(image_path)
-        if img is None: raise ValueError("Image not found")
+        if img is None:
+            raise ValueError("Image not found")
         
-        flat = img.flatten()
+        original_shape = img.shape
+        h, w, channels = original_shape
+        
+        # Pad to even dimensions for lossless wavelet decomposition
+        pad_h = h % 2
+        pad_w = w % 2
+        if pad_h or pad_w:
+            img_padded = np.zeros((h + pad_h, w + pad_w, channels), dtype=np.uint8)
+            img_padded[:h, :w, :] = img
+            if pad_h:
+                img_padded[h, :w, :] = img[h-1, :, :]
+            if pad_w:
+                img_padded[:h, w, :] = img[:, w-1, :]
+            if pad_h and pad_w:
+                img_padded[h, w, :] = img[h-1, w-1, :]
+            img = img_padded
+        
         shape = img.shape
+        hp, wp, _ = shape
+        flat = img.flatten()
         
         # 2. Key Generation (Plaintext Sensitive)
-        x0 = self._get_hash_initial_conditions(flat.tobytes())
-        key_conf, key_diff1, key_diff2 = self._generate_keys(flat.size, x0)
+        x0, hash_hex = self._get_hash_initial_conditions(flat.tobytes())
         
-        # 3. Confusion (Scrambling Pixel Positions)
+        # BWT on hash for additional randomness
+        bwt_data, bwt_index = self._bwt_transform(hash_hex.encode())
+        
+        # Generate random binary string (str) from BWT index
+        np.random.seed(bwt_index % (2**31))
+        random_str = np.random.randint(0, 256, size=32, dtype=np.uint8)
+        
+        # PSM on random string with BWT output to get STR_new
+        bwt_key = np.frombuffer(bwt_data[:32].ljust(32, b'\x01'), dtype=np.uint8)
+        str_new = self._psm_encrypt(random_str, bwt_key)
+        
+        # Modify initial conditions using str_new
+        x0_modified = [x0[i] + (str_new[i] / 10000.0) for i in range(5)]
+        
+        # 3. Generate chaotic sequences for confusion
+        states_conf = self._generate_chaotic_sequences(flat.size, x0_modified)
+        
+        # 4. Initial Scrambling (Confusion on full image)
+        key_conf = states_conf[:flat.size, 0]
         sort_indices = np.argsort(key_conf)
         scrambled_flat = flat[sort_indices]
+        scrambled_img = scrambled_flat.reshape(shape)
         
-        # 4. Diffusion with CBC-style feedback (two passes for full propagation)
-        # Forward pass with key1: each C[i] depends on C[i-1]
-        diffused = self._diffuse_forward(scrambled_flat, key_diff1)
-        # Backward pass with key2: each C[i] depends on C[i+1]
-        encrypted_flat = self._diffuse_backward(diffused, key_diff2)
+        # 5. Wavelet-domain Diffusion (per channel)
+        encrypted_channels = []
         
-        # Reshape back to image
-        encrypted_img = encrypted_flat.reshape(shape)
+        for ch in range(channels):
+            channel = scrambled_img[:, :, ch]
+            
+            # Wavelet decomposition → 4 sub-bands (LL, LH, HL, HH)
+            LL, LH, HL, HH = self._wavelet_decompose(channel)
+            sub_bands = [LL, LH, HL, HH]
+            
+            encrypted_sub_bands = []
+            
+            for sb_idx, sb in enumerate(sub_bands):
+                sb_size = len(sb)
+                
+                # Generate keys for this sub-band
+                sb_seed = [x0_modified[j] + (ch * 4 + sb_idx + 1) * 0.00137 for j in range(5)]
+                sb_states = self._generate_chaotic_sequences(sb_size, sb_seed)
+                
+                # Scramble sub-band
+                scramble_key = sb_states[:, 2]
+                sb_sort_idx = np.argsort(scramble_key)
+                sb_scrambled = sb[sb_sort_idx]
+                
+                # PSM on sub-band
+                psm_key = self._generate_key_stream(sb_size, sb_states, 1)
+                sb_encrypted = self._psm_encrypt(sb_scrambled, psm_key)
+                
+                encrypted_sub_bands.append(sb_encrypted)
+            
+            # Random shuffle of 4 sub-band components
+            shuffle_seed_val = int(np.abs(states_conf[ch * 100 + 50, 4]) * 10000) % (2**31)
+            rng = np.random.RandomState(shuffle_seed_val)
+            shuffle_order = rng.permutation(4)
+            
+            # Shuffle: position i gets sub-band shuffle_order[i]
+            shuffled_sbs = [encrypted_sub_bands[shuffle_order[i]] for i in range(4)]
+            
+            # Reconstruct channel from shuffled encrypted sub-bands (IWLT)
+            reconstructed = self._wavelet_reconstruct(
+                shuffled_sbs[0], shuffled_sbs[1], shuffled_sbs[2], shuffled_sbs[3], hp, wp)
+            
+            encrypted_channels.append(reconstructed)
         
-        return encrypted_img, x0, sort_indices, shape
+        # Stack channels
+        encrypted_img_pre = np.stack(encrypted_channels, axis=2)
+        
+        # 6. Final PSM pass on full image
+        enc_flat = encrypted_img_pre.flatten()
+        final_seed = [x0_modified[i] + 0.00777 for i in range(5)]
+        final_states = self._generate_chaotic_sequences(len(enc_flat), final_seed)
+        final_psm_key = self._generate_key_stream(len(enc_flat), final_states, 0)
+        encrypted_final = self._psm_encrypt(enc_flat, final_psm_key)
+        
+        encrypted_img = encrypted_final.reshape(shape)
+        
+        # Metadata for decryption
+        metadata = {
+            'x0_modified': x0_modified,
+            'sort_indices': sort_indices,
+            'shape': shape,
+            'original_shape': original_shape,
+        }
+        
+        return encrypted_img, metadata
 
-    def decrypt(self, encrypted_img, x0, sort_indices, original_shape):
+    def decrypt(self, encrypted_img, metadata):
+        import cv2
+        
+        x0_modified = metadata['x0_modified']
+        sort_indices = metadata['sort_indices']
+        shape = metadata['shape']
+        original_shape = metadata['original_shape']
+        hp, wp, channels = shape
+        
         flat = encrypted_img.flatten()
         
-        # 1. Regenerate Keys (Using same x0)
-        _, key_diff1, key_diff2 = self._generate_keys(flat.size, x0)
+        # 1. Inverse Final PSM
+        final_seed = [x0_modified[i] + 0.00777 for i in range(5)]
+        final_states = self._generate_chaotic_sequences(len(flat), final_seed)
+        final_psm_key = self._generate_key_stream(len(flat), final_states, 0)
+        dec_flat = self._psm_decrypt(flat, final_psm_key)
         
-        # 2. Inverse Diffusion (reverse order: backward first, then forward)
-        inv_backward = self._inverse_diffuse_backward(flat, key_diff2)
-        decrypted_diff = self._inverse_diffuse_forward(inv_backward, key_diff1)
+        dec_img = dec_flat.reshape(shape)
         
-        # 3. Inverse Confusion (Un-shuffling)
-        decrypted_conf = np.zeros_like(decrypted_diff)
-        decrypted_conf[sort_indices] = decrypted_diff
+        # Regenerate confusion states for shuffle seeds
+        states_conf = self._generate_chaotic_sequences(np.prod(shape), x0_modified)
         
-        # Reshape
-        return decrypted_conf.reshape(original_shape)
+        # 2. Per channel: WLT → unshuffle → inverse PSM → inverse scramble → IWLT
+        decrypted_channels = []
+        
+        for ch in range(channels):
+            channel = dec_img[:, :, ch]
+            
+            # Wavelet decomposition
+            LL, LH, HL, HH = self._wavelet_decompose(channel)
+            sub_bands_encrypted = [LL, LH, HL, HH]
+            
+            # Determine shuffle order (same seed as encryption)
+            shuffle_seed_val = int(np.abs(states_conf[ch * 100 + 50, 4]) * 10000) % (2**31)
+            rng = np.random.RandomState(shuffle_seed_val)
+            shuffle_order = rng.permutation(4)
+            
+            # Unshuffle: during encryption, position i got sub-band shuffle_order[i]
+            # So current position i contains original sub-band shuffle_order[i]
+            unshuffled_sbs = [None] * 4
+            for i in range(4):
+                unshuffled_sbs[shuffle_order[i]] = sub_bands_encrypted[i]
+            
+            # Decrypt each sub-band: inverse PSM → inverse scramble
+            decrypted_sub_bands = []
+            
+            for sb_idx in range(4):
+                sb_encrypted = unshuffled_sbs[sb_idx]
+                sb_size = len(sb_encrypted)
+                
+                # Regenerate same keys
+                sb_seed = [x0_modified[j] + (ch * 4 + sb_idx + 1) * 0.00137 for j in range(5)]
+                sb_states = self._generate_chaotic_sequences(sb_size, sb_seed)
+                
+                # Inverse PSM
+                psm_key = self._generate_key_stream(sb_size, sb_states, 1)
+                sb_decrypted = self._psm_decrypt(sb_encrypted, psm_key)
+                
+                # Inverse scramble
+                scramble_key = sb_states[:, 2]
+                sb_sort_idx = np.argsort(scramble_key)
+                sb_unscrambled = np.zeros_like(sb_decrypted)
+                sb_unscrambled[sb_sort_idx] = sb_decrypted
+                
+                decrypted_sub_bands.append(sb_unscrambled)
+            
+            # Inverse Wavelet Transform to reconstruct channel
+            reconstructed = self._wavelet_reconstruct(
+                decrypted_sub_bands[0], decrypted_sub_bands[1],
+                decrypted_sub_bands[2], decrypted_sub_bands[3], hp, wp)
+            
+            decrypted_channels.append(reconstructed)
+        
+        # Stack channels
+        decrypted_img = np.stack(decrypted_channels, axis=2)
+        
+        # 3. Inverse Confusion (un-shuffle full image)
+        dec_flat = decrypted_img.flatten()
+        result = np.zeros_like(dec_flat)
+        result[sort_indices] = dec_flat
+        
+        # Reshape to padded size, then trim to original
+        result_img = result.reshape(shape)
+        return result_img[:original_shape[0], :original_shape[1], :]

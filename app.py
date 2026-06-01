@@ -20,9 +20,11 @@ def main():
     
     # Encrypt
     try:
-        cipher_img, x0, sort_indices, shape = encryptor.encrypt(image_path)
+        cipher_img, metadata = encryptor.encrypt(image_path)
     except Exception as e:
         print(f"Encryption Failed: {e}")
+        import traceback
+        traceback.print_exc()
         return
     
     # Save as PNG to prevent compression artifacts affecting analysis
@@ -34,7 +36,7 @@ def main():
     enc_loaded = cv2.imread('encrypted.png')
     
     # Decrypt
-    decrypted_img = encryptor.decrypt(enc_loaded, x0, sort_indices, shape)
+    decrypted_img = encryptor.decrypt(enc_loaded, metadata)
     
     # Save Result
     cv2.imwrite('decrypted.png', decrypted_img)
