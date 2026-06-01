@@ -73,15 +73,8 @@ class ImageEncryption:
         scrambled_flat = flat[sort_indices]
         
         # 4. Diffusion (Modifying Pixel Values)
-        # REPLACED: XOR with modular polyalphabetic substitution
-        # encrypted_flat = np.bitwise_xor(scrambled_flat, key_diff)
-        
-        # Convert to int32 to prevent uint8 overflow during addition
-        scrambled_int = scrambled_flat.astype(np.int32)
-        key_diff_int = key_diff.astype(np.int32)
-        
-        # Apply C = (P + K) mod 256
-        encrypted_flat = np.mod(scrambled_int + key_diff_int, 256).astype(np.uint8)
+        # XOR with the diffusion key
+        encrypted_flat = np.bitwise_xor(scrambled_flat, key_diff)
         
         # Reshape back to image
         encrypted_img = encrypted_flat.reshape(shape)
@@ -97,16 +90,8 @@ class ImageEncryption:
         # 1. Regenerate Keys (Using same x0)
         _, key_diff = self._generate_keys((flat.size, 1), x0)
         
-        # 2. Inverse Diffusion
-        # REPLACED: XOR with inverse modular substitution
-        #decrypted_diff = np.bitwise_xor(flat, key_diff)
-        
-        # Convert to int32 to prevent uint8 underflow during subtraction
-        flat_int = flat.astype(np.int32)
-        key_diff_int = key_diff.astype(np.int32)
-        
-        # Apply P = (C - K) mod 256
-        decrypted_diff = np.mod(flat_int - key_diff_int, 256).astype(np.uint8)
+        # 2. Inverse Diffusion (XOR is its own inverse)
+        decrypted_diff = np.bitwise_xor(flat, key_diff)
         
         # 3. Inverse Confusion (Un-shuffling)
         # Create an empty array and place pixels back in original positions
